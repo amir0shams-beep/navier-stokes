@@ -33,7 +33,7 @@ def main():
         stats = sim.step()
         if t % 100 == 0:
             print(
-                f"step {t:5d}  K={stats['K']:.4f}  U={stats['U']:.4f}  E={stats['E']:.4f}"
+                f"step {t:5d}  K={stats['K']:.8f}  U={stats['U']:.8f}  E={stats['E']:.8f}"
             )
 
 
