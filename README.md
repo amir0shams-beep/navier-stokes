@@ -21,3 +21,6 @@ computational sciences project for summer 2025-molecular dynamics of water
 - `setup.py` — install script
 - `requirements.txt` — dependencies (start empty)
 - `README.md` — how to run + notes (this file)
+## Run the LJ demo
+pip install -e .
+python -m mdwater.examples.lj_demo
