@@ -24,3 +24,5 @@ computational sciences project for summer 2025-molecular dynamics of water
 ## Run the LJ demo
 pip install -e .
 python -m mdwater.examples.lj_demo
+## Run the water demo
+python3 -m mdwater.examples.water_demo
