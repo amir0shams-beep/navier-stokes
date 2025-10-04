@@ -28,13 +28,18 @@ def main():
 
     dt = 0.0005  # small because bonds/angles are stiff springs
     sim = MDSim(x0, v0, m, force_fn, dt)
+    E0 = None
 
     for t in range(3000):
         stats = sim.step()
+        if E0 is None:
+            E0 = stats["E"]
         if t % 100 == 0:
             print(
                 f"step {t:5d}  K={stats['K']:.8f}  U={stats['U']:.8f}  E={stats['E']:.8f}"
             )
+
+    print(f"Relative energy drift = {abs(stats['E'] - E0) / abs(E0):.2e}")
 
 
 if __name__ == "__main__":
