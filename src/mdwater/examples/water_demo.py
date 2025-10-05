@@ -24,7 +24,10 @@ def main():
     )
 
     def force_fn(x, **kw):
-        return water_forces(x, types, molecules, params, rcut=6.0, box=None)
+        # Use an LJ cutoff; don't cut Coulomb for this small non-PBC demo
+        return water_forces(
+            x, types, molecules, params, box=None, rcut_lj=6.0, rcut_coulomb=None
+        )
 
     dt = 0.0005  # small because bonds/angles are stiff springs
     sim = MDSim(x0, v0, m, force_fn, dt)
