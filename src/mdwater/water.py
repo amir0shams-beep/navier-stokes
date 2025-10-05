@@ -1,5 +1,21 @@
 import numpy as np
 
+# Try importing the PBC helper; if it fails for any reason, define a local fallback.
+try:
+    from .pbc import minimum_image
+except Exception:
+
+    def _as_boxv(box):
+        return (
+            np.array([box] * 3, float) if np.isscalar(box) else np.asarray(box, float)
+        )
+
+    def minimum_image(rij, box):
+        if box is None:
+            return rij
+        b = _as_boxv(box)
+        return rij - b * np.round(rij / b)
+
 
 # ---------- Topology helpers ----------
 def build_one_water_geometry(bond=0.9572, angle_deg=104.52):
@@ -50,12 +66,13 @@ def place_waters_grid(n_side=2, spacing=3.0, bond=0.9572, angle_deg=104.52):
     return np.array(coords, float), np.array(types, dtype=object), molecules
 
 
-# ---------- Intramolecular forces: bonds + angle ----------
+# ---------- Intramolecular forces: bonds + angle (PBC-aware) ----------
 def bond_angle_forces(
-    x, molecules, k_bond=300.0, r_eq=0.9572, k_theta=50.0, theta_eq_deg=104.52
+    x, molecules, k_bond=300.0, r_eq=0.9572, k_theta=50.0, theta_eq_deg=104.52, box=None
 ):
     """
-    Harmonic bonds (H-O) and harmonic angle (H-O-H).
+    Harmonic bonds (H-O) and harmonic angle (H-O-H), using minimum-image vectors
+    when a periodic box is provided.
     Returns (forces, potential).
     """
     N = x.shape[0]
@@ -65,9 +82,9 @@ def bond_angle_forces(
     eps = 1e-12
 
     for h1, o, h2 in molecules:
-        # --- bonds: (1/2) k (|r| - r_eq)^2
+        # --- bonds: (1/2) k (|r| - r_eq)^2 with minimum image for H-O vectors
         for h in (h1, h2):
-            rij = x[h] - x[o]
+            rij = minimum_image(x[h] - x[o], box)
             r = np.linalg.norm(rij) + eps
             dr = r - r_eq
             U += 0.5 * k_bond * dr * dr
@@ -77,17 +94,20 @@ def bond_angle_forces(
             f[o] -= F
 
         # --- angle: (1/2) k_theta (theta - theta_eq)^2
-        a = x[h1] - x[o]
-        b = x[h2] - x[o]
+        # Use minimum-image vectors for H1-O and H2-O to measure the angle
+        a = minimum_image(x[h1] - x[o], box)
+        b = minimum_image(x[h2] - x[o], box)
         ra = np.linalg.norm(a) + eps
         rb = np.linalg.norm(b) + eps
+
         cos_th = np.clip(np.dot(a, b) / (ra * rb), -1.0, 1.0)
         th = np.arccos(cos_th)
         dth = th - theta_eq
         U += 0.5 * k_theta * dth * dth
 
+        # Derivatives for angle forces
         sin_th = np.sqrt(max(1.0 - cos_th * cos_th, 1e-14))
-        # dtheta/da and dtheta/db
+        # dcos/da and dcos/db
         dcos_da = (b / (ra * rb)) - (cos_th / (ra * ra)) * a
         dcos_db = (a / (ra * rb)) - (cos_th / (rb * rb)) * b
         dth_da = -(1.0 / sin_th) * dcos_da
@@ -104,7 +124,7 @@ def bond_angle_forces(
     return f, U
 
 
-# ---------- Intermolecular forces: Coulomb + O-O LJ ----------
+# ---------- Intermolecular forces: Coulomb + O-O LJ (PBC-aware) ----------
 def coulomb_and_OO_lj(
     x,
     types,
@@ -114,20 +134,21 @@ def coulomb_and_OO_lj(
     kC=1.0,
     epsilon_OO=0.2,
     sigma_OO=3.166,
-    rcut=None,
+    rcut_lj=None,  # separate cutoff for LJ
+    rcut_coulomb=None,  # separate cutoff for Coulomb (None = no cutoff)
     box=None,
 ):
     """
     Interactions between atoms of DIFFERENT molecules only:
       - Coulomb for all pairs (i,j) with mol(i) != mol(j)
       - Lennard-Jones only for O-O pairs
-    Units arbitrary. kC, epsilon, sigma set scales.
+    Uses a potential-shift for LJ so U(rcut_lj) = 0.
     """
     N = x.shape[0]
     f = np.zeros_like(x)
     U = 0.0
 
-    # map atom -> mol id
+    # atom -> mol id
     atom2mol = {}
     for mid, (h1, o, h2) in enumerate(molecules):
         atom2mol[h1] = mid
@@ -137,41 +158,47 @@ def coulomb_and_OO_lj(
     # charges by type
     q = np.where(types == "O", q_O, q_H)
 
-    if box is not None:
-        boxv = np.array([box] * 3) if np.isscalar(box) else np.asarray(box)
+    # Precompute LJ shift at rcut (potential shift only)
+    Ulj_shift = 0.0
+    if rcut_lj is not None:
+        inv_rc2 = 1.0 / (rcut_lj * rcut_lj)
+        sr2c = (sigma_OO * sigma_OO) * inv_rc2
+        sr6c = sr2c * sr2c * sr2c
+        sr12c = sr6c * sr6c
+        Ulj_shift = 4.0 * epsilon_OO * (sr12c - sr6c)
 
     for i in range(N - 1):
         for j in range(i + 1, N):
             if atom2mol[i] == atom2mol[j]:
-                continue  # skip intra-molecular here (handled by bonds/angle)
+                continue  # intra-molecular handled by bonds/angle
 
-            rij = x[j] - x[i]
-            if box is not None:
-                rij -= boxv * np.round(rij / boxv)  # minimum image
-            r2 = np.dot(rij, rij)
+            rij = minimum_image(x[j] - x[i], box)
+            r2 = float(np.dot(rij, rij))
             if r2 == 0.0:
-                continue
-            if rcut is not None and r2 > rcut * rcut:
                 continue
 
             r = np.sqrt(r2)
-            inv_r3 = 1.0 / (r2 * r)
-
-            # Coulomb
-            Uc = kC * q[i] * q[j] / r
-            Fc = kC * q[i] * q[j] * inv_r3 * rij
-
-            # O-O Lennard-Jones
+            inv_r2 = 1.0 / r2
+            Uc = 0.0
+            Fc = 0.0
             Ulj = 0.0
             Flj = 0.0
+
+            # Coulomb (optional cutoff; recommend None for small systems)
+            if (rcut_coulomb is None) or (r2 <= rcut_coulomb * rcut_coulomb):
+                Uc = kC * q[i] * q[j] / r
+                Fc = kC * q[i] * q[j] * (rij / (r2 * r))
+
+            # O-O Lennard-Jones with potential shift
             if types[i] == "O" and types[j] == "O":
-                inv_r2 = 1.0 / r2
-                sr2 = (sigma_OO * sigma_OO) * inv_r2
-                sr6 = sr2 * sr2 * sr2
-                sr12 = sr6 * sr6
-                Ulj = 4.0 * epsilon_OO * (sr12 - sr6)
-                coef = 24.0 * epsilon_OO * (2.0 * sr12 - sr6) * inv_r2
-                Flj = coef * rij
+                if (rcut_lj is None) or (r2 <= rcut_lj * rcut_lj):
+                    sr2 = (sigma_OO * sigma_OO) * inv_r2
+                    sr6 = sr2 * sr2 * sr2
+                    sr12 = sr6 * sr6
+                    Ulj_base = 4.0 * epsilon_OO * (sr12 - sr6)
+                    Ulj = Ulj_base - Ulj_shift  # shift so U(rcut_lj) = 0
+                    coef = 24.0 * epsilon_OO * (2.0 * sr12 - sr6) * inv_r2
+                    Flj = coef * rij  # standard LJ force (no force-shift)
 
             f[i] -= Fc + Flj
             f[j] += Fc + Flj
@@ -181,7 +208,9 @@ def coulomb_and_OO_lj(
 
 
 # ---------- Combined water force ----------
-def water_forces(x, types, molecules, params, box=None, rcut=None):
+def water_forces(
+    x, types, molecules, params, box=None, rcut_lj=None, rcut_coulomb=None
+):
     """
     params: dict with keys:
       k_bond, r_eq, k_theta, theta_eq_deg, q_H, q_O, kC, epsilon_OO, sigma_OO
@@ -194,6 +223,7 @@ def water_forces(x, types, molecules, params, box=None, rcut=None):
         r_eq=params.get("r_eq", 0.9572),
         k_theta=params.get("k_theta", 50.0),
         theta_eq_deg=params.get("theta_eq_deg", 104.52),
+        box=box,
     )
     f2, U2 = coulomb_and_OO_lj(
         x,
@@ -204,7 +234,8 @@ def water_forces(x, types, molecules, params, box=None, rcut=None):
         kC=params.get("kC", 1.0),
         epsilon_OO=params.get("epsilon_OO", 0.2),
         sigma_OO=params.get("sigma_OO", 3.166),
-        rcut=rcut,
+        rcut_lj=rcut_lj,
+        rcut_coulomb=rcut_coulomb,
         box=box,
     )
     return f1 + f2, U1 + U2
