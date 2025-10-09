@@ -1,6 +1,11 @@
 import numpy as np
 
-# Try importing the PBC helper; if it fails for any reason, define a local fallback.
+try:
+    from .ewald import ewald_coulomb_forces_energy
+except Exception:
+    ewald_coulomb_forces_energy = None  # fallback if not available
+
+
 try:
     from .pbc import minimum_image
 except Exception:
@@ -213,10 +218,15 @@ def water_forces(
 ):
     """
     params: dict with keys:
-      k_bond, r_eq, k_theta, theta_eq_deg, q_H, q_O, kC, epsilon_OO, sigma_OO
+      k_bond, r_eq, k_theta, theta_eq_deg,
+      q_H, q_O, kC,
+      epsilon_OO, sigma_OO,
+      coulomb_method ('direct'|'ewald'),
+      ewald_alpha, ewald_r_real, ewald_kmax
     Returns (forces, potential)
     """
-    f1, U1 = bond_angle_forces(
+    # 1) Intramolecular bonds + angle (PBC-aware)
+    f_ba, U_ba = bond_angle_forces(
         x,
         molecules,
         k_bond=params.get("k_bond", 300.0),
@@ -225,17 +235,63 @@ def water_forces(
         theta_eq_deg=params.get("theta_eq_deg", 104.52),
         box=box,
     )
-    f2, U2 = coulomb_and_OO_lj(
+
+    # 2) Intermolecular O–O Lennard-Jones (shifted at rcut_lj)
+    #    (We reuse coulomb_and_OO_lj with charges zeroed to get only LJ.)
+    epsilon_OO = params.get("epsilon_OO", 0.2)
+    sigma_OO = params.get("sigma_OO", 3.166)
+
+    f_lj, U_lj = coulomb_and_OO_lj(
         x,
         types,
         molecules,
-        q_H=params.get("q_H", +0.4238),
-        q_O=params.get("q_O", -0.8476),
-        kC=params.get("kC", 1.0),
-        epsilon_OO=params.get("epsilon_OO", 0.2),
-        sigma_OO=params.get("sigma_OO", 3.166),
+        q_H=0.0,
+        q_O=0.0,  # zero-out charges => LJ-only
+        kC=0.0,
+        epsilon_OO=epsilon_OO,
+        sigma_OO=sigma_OO,
         rcut_lj=rcut_lj,
-        rcut_coulomb=rcut_coulomb,
+        rcut_coulomb=None,
         box=box,
     )
-    return f1 + f2, U1 + U2
+
+    # 3) Coulomb: either 'direct' (previous method) or 'ewald' under PBC
+    coulomb_method = params.get("coulomb_method", "direct").lower()
+    q_H = params.get("q_H", +0.4238)
+    q_O = params.get("q_O", -0.8476)
+
+    if coulomb_method == "ewald":
+        if ewald_coulomb_forces_energy is None:
+            raise RuntimeError("Ewald module not available; did you create ewald.py?")
+        if box is None:
+            raise ValueError("Ewald requires a periodic box (box != None).")
+
+        # build charges (include intra + inter; water is neutral overall)
+        q = np.where(types == "O", q_O, q_H)
+
+        alpha = params.get("ewald_alpha", 0.25)
+        r_real = params.get("ewald_r_real", 6.0)
+        kmax = params.get("ewald_kmax", 6)
+
+        f_coul, U_coul = ewald_coulomb_forces_energy(
+            x, q, box=box, alpha=alpha, rcut_real=r_real, kmax=kmax
+        )
+
+    else:
+        # fallback: direct-space Coulomb only between different molecules (as before)
+        f_coul, U_coul = coulomb_and_OO_lj(
+            x,
+            types,
+            molecules,
+            q_H=q_H,
+            q_O=q_O,
+            kC=params.get("kC", 1.0),
+            epsilon_OO=0.0,
+            sigma_OO=1.0,  # disable LJ in this call
+            rcut_lj=None,
+            rcut_coulomb=rcut_coulomb,
+            box=box,
+        )
+
+    # total
+    return f_ba + f_lj + f_coul, U_ba + U_lj + U_coul

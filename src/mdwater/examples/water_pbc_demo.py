@@ -23,9 +23,14 @@ def main():
         theta_eq_deg=104.52,
         q_H=+0.4238,
         q_O=-0.8476,
-        kC=1.0,
+        # LJ
         epsilon_OO=0.2,
         sigma_OO=3.166,
+        # Coulomb via Ewald
+        coulomb_method="ewald",
+        ewald_alpha=0.25,
+        ewald_r_real=6.0,  # <= L/2
+        ewald_kmax=6,
     )
 
     def force_fn(x, **kw):
