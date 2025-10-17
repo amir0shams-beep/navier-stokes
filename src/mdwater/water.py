@@ -142,12 +142,14 @@ def coulomb_and_OO_lj(
     rcut_lj=None,  # separate cutoff for LJ
     rcut_coulomb=None,  # separate cutoff for Coulomb (None = no cutoff)
     box=None,
+    pairs=None,  # <-- NEW
 ):
     """
     Interactions between atoms of DIFFERENT molecules only:
       - Coulomb for all pairs (i,j) with mol(i) != mol(j)
       - Lennard-Jones only for O-O pairs
     Uses a potential-shift for LJ so U(rcut_lj) = 0.
+    If `pairs` is provided, only iterate over those i,j.
     """
     N = x.shape[0]
     f = np.zeros_like(x)
@@ -172,60 +174,63 @@ def coulomb_and_OO_lj(
         sr12c = sr6c * sr6c
         Ulj_shift = 4.0 * epsilon_OO * (sr12c - sr6c)
 
-    for i in range(N - 1):
-        for j in range(i + 1, N):
-            if atom2mol[i] == atom2mol[j]:
-                continue  # intra-molecular handled by bonds/angle
+    if pairs is None:
+        pair_iter = ((i, j) for i in range(N - 1) for j in range(i + 1, N))
+    else:
+        pair_iter = pairs
 
-            rij = minimum_image(x[j] - x[i], box)
-            r2 = float(np.dot(rij, rij))
-            if r2 == 0.0:
-                continue
+    for i, j in pair_iter:
+        if atom2mol[i] == atom2mol[j]:
+            continue  # intra-molecular handled by bonds/angle
 
-            r = np.sqrt(r2)
-            inv_r2 = 1.0 / r2
-            Uc = 0.0
-            Fc = 0.0
-            Ulj = 0.0
-            Flj = 0.0
+        rij = minimum_image(x[j] - x[i], box)
+        r2 = float(np.dot(rij, rij))
+        if r2 == 0.0:
+            continue
 
-            # Coulomb (optional cutoff; recommend None for small systems)
-            if (rcut_coulomb is None) or (r2 <= rcut_coulomb * rcut_coulomb):
-                Uc = kC * q[i] * q[j] / r
-                Fc = kC * q[i] * q[j] * (rij / (r2 * r))
+        r = np.sqrt(r2)
+        inv_r2 = 1.0 / r2
+        Uc = 0.0
+        Fc = 0.0
+        Ulj = 0.0
+        Flj = 0.0
 
-            # O-O Lennard-Jones with potential shift
-            if types[i] == "O" and types[j] == "O":
-                if (rcut_lj is None) or (r2 <= rcut_lj * rcut_lj):
-                    sr2 = (sigma_OO * sigma_OO) * inv_r2
-                    sr6 = sr2 * sr2 * sr2
-                    sr12 = sr6 * sr6
-                    Ulj_base = 4.0 * epsilon_OO * (sr12 - sr6)
-                    Ulj = Ulj_base - Ulj_shift  # shift so U(rcut_lj) = 0
-                    coef = 24.0 * epsilon_OO * (2.0 * sr12 - sr6) * inv_r2
-                    Flj = coef * rij  # standard LJ force (no force-shift)
+        # Coulomb (optional cutoff; recommend None for small systems)
+        if (rcut_coulomb is None) or (r2 <= rcut_coulomb * rcut_coulomb):
+            Uc = kC * q[i] * q[j] / r
+            Fc = kC * q[i] * q[j] * (rij / (r2 * r))
 
-            f[i] -= Fc + Flj
-            f[j] += Fc + Flj
-            U += Uc + Ulj
+        # O-O Lennard-Jones with potential shift
+        if types[i] == "O" and types[j] == "O":
+            if (rcut_lj is None) or (r2 <= rcut_lj * rcut_lj):
+                sr2 = (sigma_OO * sigma_OO) * inv_r2
+                sr6 = sr2 * sr2 * sr2
+                sr12 = sr6 * sr6
+                Ulj_base = 4.0 * epsilon_OO * (sr12 - sr6)
+                Ulj = Ulj_base - Ulj_shift  # shift so U(rcut_lj) = 0
+                coef = 24.0 * epsilon_OO * (2.0 * sr12 - sr6) * inv_r2
+                Flj = coef * rij  # standard LJ force (no force-shift)
+
+        f[i] -= Fc + Flj
+        f[j] += Fc + Flj
+        U += Uc + Ulj
 
     return f, U
 
 
 # ---------- Combined water force ----------
 def water_forces(
-    x, types, molecules, params, box=None, rcut_lj=None, rcut_coulomb=None
+    x, types, molecules, params, box=None, rcut_lj=None, rcut_coulomb=None, pairs=None
 ):
     """
     params: dict with keys:
       k_bond, r_eq, k_theta, theta_eq_deg,
-      q_H, q_O, kC,
-      epsilon_OO, sigma_OO,
+      q_H, q_O, kC, epsilon_OO, sigma_OO,
       coulomb_method ('direct'|'ewald'),
       ewald_alpha, ewald_r_real, ewald_kmax
     Returns (forces, potential)
     """
-    # 1) Intramolecular bonds + angle (PBC-aware)
+    # 1) Intramolecular (PBC-aware)
     f_ba, U_ba = bond_angle_forces(
         x,
         molecules,
@@ -236,26 +241,23 @@ def water_forces(
         box=box,
     )
 
-    # 2) Intermolecular O–O Lennard-Jones (shifted at rcut_lj)
-    #    (We reuse coulomb_and_OO_lj with charges zeroed to get only LJ.)
-    epsilon_OO = params.get("epsilon_OO", 0.2)
-    sigma_OO = params.get("sigma_OO", 3.166)
-
+    # 2) Intermolecular O–O LJ (shifted) — use pairs if provided
     f_lj, U_lj = coulomb_and_OO_lj(
         x,
         types,
         molecules,
         q_H=0.0,
-        q_O=0.0,  # zero-out charges => LJ-only
+        q_O=0.0,
         kC=0.0,
-        epsilon_OO=epsilon_OO,
-        sigma_OO=sigma_OO,
+        epsilon_OO=params.get("epsilon_OO", 0.2),
+        sigma_OO=params.get("sigma_OO", 3.166),
         rcut_lj=rcut_lj,
         rcut_coulomb=None,
         box=box,
+        pairs=pairs,
     )
 
-    # 3) Coulomb: either 'direct' (previous method) or 'ewald' under PBC
+    # 3) Coulomb: direct or Ewald
     coulomb_method = params.get("coulomb_method", "direct").lower()
     q_H = params.get("q_H", +0.4238)
     q_O = params.get("q_O", -0.8476)
@@ -264,21 +266,15 @@ def water_forces(
         if ewald_coulomb_forces_energy is None:
             raise RuntimeError("Ewald module not available; did you create ewald.py?")
         if box is None:
-            raise ValueError("Ewald requires a periodic box (box != None).")
-
-        # build charges (include intra + inter; water is neutral overall)
+            raise ValueError("Ewald requires a periodic box.")
         q = np.where(types == "O", q_O, q_H)
-
         alpha = params.get("ewald_alpha", 0.25)
         r_real = params.get("ewald_r_real", 6.0)
         kmax = params.get("ewald_kmax", 6)
-
         f_coul, U_coul = ewald_coulomb_forces_energy(
-            x, q, box=box, alpha=alpha, rcut_real=r_real, kmax=kmax
+            x, q, box=box, alpha=alpha, rcut_real=r_real, kmax=kmax, pairs=pairs
         )
-
     else:
-        # fallback: direct-space Coulomb only between different molecules (as before)
         f_coul, U_coul = coulomb_and_OO_lj(
             x,
             types,
@@ -287,11 +283,11 @@ def water_forces(
             q_O=q_O,
             kC=params.get("kC", 1.0),
             epsilon_OO=0.0,
-            sigma_OO=1.0,  # disable LJ in this call
+            sigma_OO=1.0,
             rcut_lj=None,
             rcut_coulomb=rcut_coulomb,
             box=box,
+            pairs=pairs,
         )
 
-    # total
     return f_ba + f_lj + f_coul, U_ba + U_lj + U_coul
