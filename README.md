@@ -26,3 +26,7 @@ pip install -e .
 python -m mdwater.examples.lj_demo
 ## Run the water demo
 python3 -m mdwater.examples.water_demo
+
+## Results (examples)
+- Water (no PBC): drift ≈ 3.2e-08 over 3000 steps (dt = 5e-4)
+- Water + PBC + Ewald: drift ≈ 1.0e-04 over 3000 steps (dt = 5e-4, α=0.25, r_real=6.0, kmax=6)
